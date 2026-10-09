@@ -1,0 +1,14 @@
+numpy==2.2.6
+numba==0.61.2
+orjson==3.10.18
+PyYAML==6.0.2
+python-dotenv==1.1.0
+tzdata==2025.2; platform_system == "Windows"
+uvloop==0.21.0; platform_system != "Windows"
+setuptools==75.8.2
+wheel==0.45.1
+pytest==8.3.5
+pytest-cov==6.1.1
+mypy==1.15.0
+types-PyYAML==6.0.12.20250516
+ruff==0.11.8

@@ -1,0 +1,49 @@
+mode: paper
+
+market:
+  provider: binance
+  timeframe: 1s
+  instruments:
+    - symbol: BTCUSDT
+      currency: USDT
+      tick_size: "0.01"
+      lot_size: "0.00001"
+      contract_multiplier: "1"
+      price_scale: 100
+      quantity_scale: 100000
+      min_notional: "5.00"
+      session:
+        always_open: true
+        timezone: UTC
+      daily_reset: "00:00"
+
+money:
+  account_currency: USDT
+  scales:
+    USDT: 10000000
+
+capital_money_units: 100000000000
+
+risk:
+  per_instrument:
+    BTCUSDT:
+      max_position_lots: 100
+      max_notional_money_units: 10000000000
+  max_daily_loss_money_units: 5000000000
+  max_open_trades: 3
+  max_order_rate: 10
+  order_rate_window_seconds: 1
+  price_sanity_band_bps: 500
+  repeated_rejection_limit: 3
+
+queues:
+  tick_capacity: 4096
+  order_capacity: 256
+  event_capacity: 4096
+
+feed_stale_after_ms: 3000
+
+execution:
+  stop_execution: bot_side
+  live_enabled: false
+  live_confirmation: null
