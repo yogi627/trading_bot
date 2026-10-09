@@ -89,6 +89,8 @@ The `.env` file is parsed with pinned `python-dotenv`; values from the real proc
 
 Configuration uses a duplicate-key-rejecting YAML safe loader. Decimal-valued config fields must be quoted strings or integers (never YAML floats). Session times must be quoted. Sessions may be `always_open: true` with an IANA timezone, or a local open/close pair; an open time later than close represents a session crossing midnight. `daily_reset` uses the instrument session timezone, including its DST rules. `AppConfig.timeframe_ns` exposes the parsed interval in nanoseconds.
 
+`candle_ring_size` configures each instrument's preallocated candle lookback. `candle_anchor` defaults to `epoch`; `session_open` aligns each bucket grid to that instrument's session open in its IANA timezone (an always-open instrument falls back to epoch). `flat_carry_forward_empty_buckets` defaults false. When enabled, empty buckets become zero-volume flat candles at the previous close; this advances bar-count indicators through no-trade intervals, unlike the default which emits no candle and leaves those indicators unchanged. `allow_degraded_candles` defaults false and controls whether strategy code may use candles marked degraded.
+
 ```python
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -308,10 +310,23 @@ An `EXIT` signal requests position reduction. Every generated order declares `re
 
 All ordinary work queues have configured finite capacity:
 
-- **Ticks:** bounded. Feed ingestion may coalesce ticks by instrument or drop stale ticks under configured policy; sequence gaps and drops are counted. Duplicate ticks are discarded. Candle aggregation receives the freshest permitted tick stream.
-- **Order candidates:** bounded. A full order queue immediately latches the kill switch and blocks new orders; it never silently drops an order candidate and continues trading.
-- **Broker order updates, fills, and cancels:** bounded reliable delivery. Producers apply backpressure (`await put`/provider flow control) rather than dropping events. If the provider cannot be backpressured and reliable delivery cannot be guaranteed, execution halts and reconciles before resuming.
-- **Journal/log events:** bounded off-hot-path queues with an explicit durability policy. They cannot block tick processing; journal failure is surfaced to lifecycle supervision and can fail closed according to configured policy.
+- **Ticks:** the bounded main deque stores ticks only; `depth` and `high_water_mark` exclude pending gaps. There is at most one pending `DataGap` per instrument outside that deque, and consecutive gaps merge their sequence range; differing causes become `MIXED`. `gap_events` counts pending markers and `missing_ticks` counts missing sequence numbers. `get()`/`drain()` emit a marker immediately before the next affected tick for its instrument. The candle path constructs `TickQueue(max_staleness_ns=None)`: it never drops or coalesces ticks, and a full fresh buffer raises `QueueSaturatedError`. Coalescing is opt-in only for latest-price consumers. Staleness uses the supplied `Clock.monotonic_ns()`, never a direct system-clock read. Sequence tracking is per instrument: equal is duplicate, lower is out of order and emits `OUT_OF_ORDER_DROP`, and missing sequence numbers increment `missing_ticks`. Stale-dropped sequence numbers advance sequence state, preventing a false gap at the next tick. `reset_sequence(instrument)` clears adapter sequence state and queues a `RECONNECT` marker. Ticks without sequence IDs are never deduplicated; production feed adapters must reject feeds that cannot provide sequence or trade IDs.
+- The feed-ingest boundary catches `QueueSaturatedError`, increments `tick_buffer_overflows`, and calls the global kill switch; the queue's `on_full` hook also latches it immediately and exactly once. This is deliberately idempotent: the exception remains visible to supervise shutdown and reconciliation.
+
+The runtime wires `on_full=kill_switch.latch`; its synchronous feed-ingest boundary owns the overflow counter and visible exception:
+
+```python
+def enqueue_tick(tick: Tick) -> None:
+    try:
+        tick_queue.put_nowait(tick, now_monotonic_ns=clock.monotonic_ns())
+    except QueueSaturatedError:
+        metrics.tick_buffer_overflows += 1
+        kill_switch.latch("tick_buffer_overflow")  # idempotent if the queue hook already latched
+        raise
+```
+- **Order candidates:** bounded. A full order queue immediately latches halt, invokes its callback once, and raises `OrderQueueFullError` carrying the unqueued candidate even if the callback itself fails; `hook_failed` exposes callback failure. The execution coordinator journals discarded pending orders with `drain_and_discard()`, which completes task accounting for every removed item. The queue's `assert_submission_allowed` is only a placeholder: Module 8's coordinator must read the global kill-switch latch after dequeue and immediately before broker submission, so already-dequeued candidates cannot bypass a later kill latch.
+- **Broker order updates, fills, and cancels:** bounded reliable delivery. Producers use awaited backpressure rather than dropping events. Canceling a blocked `put()` during shutdown can leave broker/local event delivery uncertain; lifecycle shutdown must reconcile broker orders, fills, and positions before any restart or resume.
+- **Journal/log events:** bounded off-hot-path queues with `JournalQueue` policy `drop_with_counter` or `fail_closed`. The first drops with a counter; the second latches the kill switch through its hook and raises. Neither performs I/O in the tick handler.
 
 The only tick-to-order performance measurement is monotonic time from tick receipt through signal generation to order submission start/completion. Latency histograms report p50 and p99. The synchronous tick handler avoids per-tick history allocations and stays free of I/O. Async queue handoffs and broker network time are measured separately from internal processing.
 
@@ -336,6 +351,12 @@ Partial fills update realized exposure immediately; unfilled remainder remains p
 
 Every non-live mode (`paper` and `backtest`) checks the final merged environment for trading credentials and fails closed if any are present. Separately named provider-scoped read-only market-data credentials are permitted in paper mode. Tests use injected environments/config and seeded random sources.
 
+## Candle Builder
+
+`CandleBuilder` holds independent state per instrument and updates OHLCV in O(1) per tick. Bucket starts use integer arithmetic on `event_time_ns` and `timeframe_ns`. A candle closes only when the first tick of a later bucket arrives; `flush_until(now_ns)` is driven by the runtime from the injected clock's wall-time timestamp, never from the tick handler. The callback receives each emitted candle, including any configured synthetic flat carry-forward candles. Closed candles are immutable and never restated.
+
+Each instrument has preallocated NumPy `int64` ring arrays for open/high/low/close ticks, volume lots, and bucket start nanoseconds; ring capacity is `candle_ring_size`. The steady-state tick path creates no Candle object unless it closes a bucket. Out-of-order/closed-bucket ticks, duplicate sequences, and nonpositive sizes are dropped and counted. A `DataGap` degrades its event-time bucket; gaps arriving before closure mark the active/future bucket, while a gap for an already-closed bucket increments a late-gap counter rather than restating history. `Candle.degraded` is true for affected buckets. Strategies must reject degraded candles unless `allow_degraded_candles: true` is explicitly configured.
+
 ## Backtesting and clock
 
 Backtests replay historical events through the same strategy, risk checks, execution coordinator, and `PaperBroker`/simulated broker contracts used in paper mode. The simulator applies configured fees, taxes, spread, slippage, partial fills, rejects, and latency. Event ordering is causal: a decision can only use data available at that event time; candles are emitted only when complete. No future bars, finalized candle values, or future-derived indicators are visible to earlier decisions.
@@ -352,8 +373,8 @@ Each item is a separate review checkpoint. Implement only the next module, run i
 
 1. **`domain.py` and `config.py`**: tick/lot internal values, currency money scales, per-instrument contract multipliers and risk caps, and validated immutable configuration. Tests cover exact money representation, decimal parsing, dotenv precedence, credential classes, duplicate YAML keys, sessions/DST, and domain invariants.
 2. **`clock.py`**: `SystemClock` using `time.perf_counter_ns()` and independent `DeterministicClock` with `advance(timedelta)` / `advance_ns(int)`. Tests cover equal/earlier event timestamps, sub-microsecond nanoseconds, rejected invalid advances, UTC wall time, and instance independence.
-3. **`queues.py`**: bounded queue policies. Tests: tick coalescing/drop and duplicate handling; order-queue full latches halt; reliable update queue backpressure does not drop fill/cancel events.
-4. **`candle_builder.py`**: incremental aggregation with preallocated ring buffers. Tests: boundaries, out-of-order/duplicate ticks, volume/OHLC correctness, O(1)-style bounded state, configured interval handling.
+3. **`queues.py`**: bounded queues with per-instrument sequence state, gap markers, `get_nowait`/`drain`, order submission gating, and journal overflow policies. Tests cover sequence/gap counters, no-sequence retention, wait wakeups, stale policy, full queue halt-once behavior, drained-order journal handoff, post-latch submission refusal, journal policies, reliable event cancellation, and Hypothesis-generated put/get interleavings.
+4. **`candle_builder.py`**: incremental per-instrument aggregation with preallocated NumPy ring buffers, epoch/session-open anchors, gap degradation, `flush_until`, and configurable empty-bucket carry-forward. Tests: exact boundaries, random-stream parity against a naive reference, duplicate/out-of-order/closed-bucket/invalid-size counters, interleaved instruments, DST/IST anchors, flush, ring wrap, degraded gap position, and steady-state tracemalloc allocation check. Benchmark `on_tick` nanoseconds/call.
 5. **`indicators/streaming.py` and `kernels.py`**: incremental EMA, RSI, ATR, VWAP. Tests: reference values, warmup, reset, incremental-vs-batch parity, no full-history dependency.
 6. **`strategy/base.py` and `ema_atr_trend.py`**: strategy contract and EMA crossover with ATR stop/trend filter. Tests: crossover entries/exits, filter suppression, stop calculation, no signal before warmup.
 7. **`risk_manager.py`**: read-only risk evaluation against immutable snapshots. Tests: each configured limit, pending exposure, price band, duplicates, stale/invalid snapshots, fail-closed behavior.

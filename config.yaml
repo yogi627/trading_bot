@@ -1,4 +1,8 @@
 mode: paper
+candle_ring_size: 512
+candle_anchor: epoch
+flat_carry_forward_empty_buckets: false
+allow_degraded_candles: false
 
 market:
   provider: binance
